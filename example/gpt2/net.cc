@@ -100,23 +100,38 @@ CausalSelfAttention::Forward(const std::vector<std::shared_ptr<infini_train::Ten
     const auto T = q->Dims()[1];
 
     // View to multi-head: local_n_head * head_dim == local_C
-    // (B, T, local_C) -> (B, T, h_l, Dh) -> (B, h_l, T, Dh)
-    k = k->View({B, T, local_n_head_, head_dim})->Transpose(1, 2);
-    q = q->View({B, T, local_n_head_, head_dim})->Transpose(1, 2);
-    v = v->View({B, T, local_n_head_, head_dim})->Transpose(1, 2);
+    // (B, T, local_C) -> (B, T, h_l, Dh)
+    k = k->View({B, T, local_n_head_, head_dim});
+    q = q->View({B, T, local_n_head_, head_dim});
+    v = v->View({B, T, local_n_head_, head_dim});
 
-    // (B, h_l, T, T)
-    auto att = q->Matmul(k->Transpose(-2, -1)) * (1.0 / std::sqrt(head_dim));
-    // (1, 1, T, T)
-    auto mask = buffers_[kParamBiasName]->Slice({0, 0, 0, 0}, {1, 1, T, T}, {1, 1, 1, 1});
-    // (1, 1, T, T) -> eq 0 -> (1, 1, T, T) -> masked_fill -> (B, h_l, T, T)
-    att = att->MaskedFill(mask == 0, -std::numeric_limits<float>::infinity());
-    // (B, h_l, T, T)
-    att = nn::function::Softmax(att, -1);
-    // (B, h_l, T, Dh)
-    auto y = att->Matmul(v);
-    // (B, h_l, T, Dh) -> (B, T, h_l, Dh) -> (B, T, local_C)
-    y = y->Transpose(1, 2)->Contiguous()->View({B, T, local_C});
+    std::shared_ptr<Tensor> y;
+    if (config_.flash) {
+        // (B, T, H, D).
+        // y = nn::function::ScaledDotProductAttention(q, k, v,
+        //                                             /*attn_mask=*/nullptr,
+        //                                             /*dropout_p=*/0.0,
+        //                                             /*is_causal=*/true);
+    } else {
+        // (B, T, h_l, Dh) -> (B, h_l, T, Dh)
+        auto q_t = q->Transpose(1, 2);
+        auto k_t = k->Transpose(1, 2);
+        auto v_t = v->Transpose(1, 2);
+        // (B, h_l, T, T)
+        auto att = q_t->Matmul(k_t->Transpose(-2, -1)) * (1.0 / std::sqrt(head_dim));
+        // (1, 1, T, T)
+        auto mask = buffers_[kParamBiasName]->Slice({0, 0, 0, 0}, {1, 1, T, T}, {1, 1, 1, 1});
+        // (1, 1, T, T) -> eq 0 -> (1, 1, T, T) -> masked_fill -> (B, h_l, T, T)
+        att = att->MaskedFill(mask == 0, -std::numeric_limits<float>::infinity());
+        // (B, h_l, T, T)
+        att = nn::function::Softmax(att, -1);
+        // (B, h_l, T, Dh)
+        y = att->Matmul(v_t);
+        // (B, h_l, T, Dh) -> (B, T, h_l, Dh)
+        y = y->Transpose(1, 2);
+    }
+    // (B, T, h_l, Dh) -> (B, T, local_C)
+    y = y->Contiguous()->View({B, T, local_C});
 
     // Get full tensor
     // (B, T, local_C) -> RowParallelLinear(n_embd, n_embd) -> (B, T, C)
@@ -326,6 +341,9 @@ GPT2::Forward(const std::vector<std::shared_ptr<infini_train::Tensor>> &x) {
 }
 
 std::shared_ptr<GPT2> GPT2::FromPretrained(ModelType model_type) {
+    return FromPretrained(model_type, /*flash=*/false);
+}
+std::shared_ptr<GPT2> GPT2::FromPretrained(ModelType model_type, bool flash) {
     // TODO(dcj): implement this later
     LOG(FATAL) << "Not implemented yet";
     return nullptr;
@@ -352,6 +370,9 @@ std::tuple<int32_t, infini_train::DataType> DetermineAndCheckVersion(const std::
 } // namespace
 
 std::shared_ptr<GPT2> GPT2::FromLLMC(const std::string &filepath) {
+    return FromLLMC(filepath, /*flash=*/false);
+}
+std::shared_ptr<GPT2> GPT2::FromLLMC(const std::string &filepath, bool flash) {
     if (!std::filesystem::exists(filepath)) {
         LOG(FATAL) << "File not found: " << filepath;
     }
@@ -379,11 +400,13 @@ std::shared_ptr<GPT2> GPT2::FromLLMC(const std::string &filepath) {
                                                         .original_vocab_size = vocab_size,
                                                         .n_layer = n_layer,
                                                         .n_head = n_head,
-                                                        .n_embd = n_embd});
+                                                        .n_embd = n_embd,
+                                                        .flash = flash});
 
     LOG(INFO) << "magic: " << magic << " version: " << version << " block_size: " << block_size
               << " vocab_size: " << vocab_size << " n_layer: " << n_layer << " n_head: " << n_head
-              << " n_embd: " << n_embd << " padded_vocab_size: " << padded_vocab_size;
+              << " n_embd: " << n_embd << " padded_vocab_size: " << padded_vocab_size
+              << " flash attention: " << flash;
 
     CHECK_EQ(n_embd % tp_size, 0) << "n_embd must be divisible by TP world size.";
     CHECK_EQ(n_embd % n_head, 0) << "n_embd must be divisible by n_head.";

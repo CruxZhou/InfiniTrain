@@ -60,6 +60,8 @@ DEFINE_uint32(val_loss_every, 0, "every how many steps to evaluate val loss?");
 DEFINE_uint32(sample_every, 0, "how often to sample from the model?");
 // debugging
 DEFINE_bool(overfit_single_batch, true, "overfit just one batch of data");
+// flash attention
+DEFINE_bool(flash, false, "Enable FlashAttention (fused scaled dot product attention)");
 // memory management
 DEFINE_string(device, "cuda", "device type (cpu/cuda), useless if using parallel training mode");
 // parallel
@@ -180,15 +182,16 @@ void Train(const nn::parallel::Rank &rank) {
     // init the model, either from scratch or from OpenAI pretrained checkpoint
     GPT2Config model_config;
     std::shared_ptr<nn::Module> model = nullptr;
+    model_config.flash = FLAGS_flash;
     if (!FLAGS_llmc_filepath.empty()) {
-        model = GPT2::FromLLMC(FLAGS_llmc_filepath);
+        model = GPT2::FromLLMC(FLAGS_llmc_filepath, FLAGS_flash);
     } else if (kModelToConfigs.count(FLAGS_model)) {
         model_config = kModelToConfigs.at(FLAGS_model);
+        model_config.flash = FLAGS_flash;
         model = std::make_shared<GPT2>(model_config);
     } else {
-        model = GPT2::FromPretrained(kStrToModelType.at(FLAGS_model));
+        model = GPT2::FromPretrained(kStrToModelType.at(FLAGS_model), FLAGS_flash);
     }
-
     model->To(device);
 
     utils::PrecisionChecker::BuildNameMap(model.get());
