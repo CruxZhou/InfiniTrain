@@ -180,6 +180,8 @@ public:
 
     static std::shared_ptr<LLaMA3> FromPretrained(ModelType model_type);
     static std::shared_ptr<LLaMA3> FromLLMC(const std::string &filepath);
+    static std::shared_ptr<LLaMA3> FromLLMC(const std::string &filepath, bool flash);
+    
 
     int GetChunkSize() const { return stage_info_.layer_ranges_per_chunk.size(); }
 

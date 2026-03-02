@@ -219,6 +219,10 @@ std::vector<std::shared_ptr<Tensor>> CausalSelfAttention::Forward(const std::vec
 
     // TODO(zbl): support flash attention later
     // if (flash_) { ... }
+    if (config_.flash) { 
+    // TODO: flash attention path
+    
+    }
 
     // manual implementation of attention
     // this materializes the large (T,T) matrix for all the queries and keys
@@ -458,6 +462,11 @@ constexpr int32_t kLLaMA3FP32Version = 3;
 } // namespace
 
 std::shared_ptr<LLaMA3> LLaMA3::FromLLMC(const std::string &filepath) {
+    return FromLLMC(filepath, /*flash=*/false); // 老接口委托新接口
+}
+
+
+std::shared_ptr<LLaMA3> LLaMA3::FromLLMC(const std::string &filepath, bool flash) {
     if (!std::filesystem::exists(filepath)) {
         LOG(FATAL) << "File not found: " << filepath;
     }
@@ -496,6 +505,7 @@ std::shared_ptr<LLaMA3> LLaMA3::FromLLMC(const std::string &filepath) {
                                                         .rope_theta = rope_theta,
                                                         .use_scaled_rope = static_cast<bool>(use_scaled_rope),
                                                         .norm_eps = norm_eps,
+                                                        .flash = flash,
                                                         .max_gen_batch_size = max_gen_bs});
 
     // ========== pp_size：num_stages; vpp_size: num_chunks_per_stage ==========
@@ -534,6 +544,7 @@ std::shared_ptr<LLaMA3> LLaMA3::FromLLMC(const std::string &filepath) {
         LOG(INFO) << "  max_gen_bs         = " << max_gen_bs;
         LOG(INFO) << "  version_major      = " << version_major;
         LOG(INFO) << "  version_minor      = " << version_minor;
+        LOG(INFO) << "  flash              = " << flash;
 
         LOG(INFO) << "Pipeline Parallel Chunks:";
         for (size_t i = 0; i < layer_ranges_per_chunk.size(); ++i) {
