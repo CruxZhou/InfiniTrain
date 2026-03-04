@@ -108,10 +108,10 @@ CausalSelfAttention::Forward(const std::vector<std::shared_ptr<infini_train::Ten
     std::shared_ptr<Tensor> y;
     if (config_.flash) {
         // (B, T, H, D).
-        // y = nn::function::ScaledDotProductAttention(q, k, v,
-        //                                             /*attn_mask=*/nullptr,
-        //                                             /*dropout_p=*/0.0,
-        //                                             /*is_causal=*/true);
+         y = nn::function::ScaledDotProductAttention(q, k, v,
+                                                     /*attn_mask=*/nullptr,
+                                                     /*dropout_p=*/0.0,
+                                                     /*is_causal=*/true);
     } else {
         // (B, T, h_l, Dh) -> (B, h_l, T, Dh)
         auto q_t = q->Transpose(1, 2);
