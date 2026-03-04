@@ -91,12 +91,16 @@ std::shared_ptr<Tensor> ScaledDotProductAttention(
     bool is_causal,
     std::optional<double> scale,
     bool enable_gqa) {
+    
+    auto q = query->Contiguous();
+    auto k = key->Contiguous();
+    auto v = value->Contiguous();
 
     std::vector<std::shared_ptr<Tensor>> inputs;
     inputs.reserve(attn_mask ? 4 : 3);
-    inputs.push_back(query);
-    inputs.push_back(key);
-    inputs.push_back(value);
+    inputs.push_back(q);
+    inputs.push_back(k);
+    inputs.push_back(v);
     if (attn_mask) {
         inputs.push_back(attn_mask);
     }
