@@ -214,16 +214,25 @@ std::vector<std::shared_ptr<Tensor>> CausalSelfAttention::Forward(const std::vec
 
     std::shared_ptr<Tensor> y;
     if (config_.flash) { 
+        std::shared_ptr<Tensor> attn_mask = nullptr;
+        if (mask) {
+            attn_mask = std::make_shared<Tensor>(mask->To(DataType::kFLOAT32));
+            attn_mask = attn_mask * static_cast<double>(std::numeric_limits<float>::lowest());
+        }
+
         y = nn::function::ScaledDotProductAttention(
             q,
             k,
             v,
-            /*attn_mask=*/nullptr,
+            /*attn_mask=*/attn_mask,
             /*dropout_p=*/0.0,
-            /*is_causal=*/true);
+            /*is_causal=*/attn_mask ? false : true);
 
         // y: (B, T, H_local, D)
     }else{
+        
+        
+        
         // (B, T, H_local, D) -> (B, H_local, T, D)
         q = q->Transpose(1, 2);
         k = k->Transpose(1, 2);

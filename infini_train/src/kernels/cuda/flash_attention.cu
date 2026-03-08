@@ -19,8 +19,8 @@
 // Supported head dims: 32, 64, 96, 128 (compile-time template parameter)
 // Causal  : yes (is_causal flag)
 // Dropout : only p = 0
-// Attn mask: not supported (nullptr)
-// GQA     : not supported (q_heads == kv_heads required)
+// Attn mask: additive float mask, broadcastable (2D or 4D)
+// GQA     : yes (H_q must be divisible by H_kv)
 
 #include <cfloat>
 #include <cmath>
@@ -63,6 +63,16 @@ __device__ __forceinline__ T StoreF(float x) {
     return common::cuda::Cast<T>(x);
 }
 
+// Load additive mask value; returns 0 if mask is nullptr.
+__device__ __forceinline__ float LoadMask(const float* __restrict__ mask,
+                                          int64_t b, int64_t h,
+                                          int64_t q, int64_t kv,
+                                          int64_t stride_b, int64_t stride_h,
+                                          int64_t stride_m, int64_t stride_n) {
+    if (mask == nullptr) return 0.0f;
+    return mask[b * stride_b + h * stride_h + q * stride_m + kv * stride_n];
+}
+
 // ============================================================================
 // FORWARD KERNEL — FlashAttention-2 style (simple, readable version)
 // ============================================================================
@@ -70,18 +80,25 @@ __device__ __forceinline__ T StoreF(float x) {
 template <typename T, int HD, int BLOCK_M, int BLOCK_N>
 __global__ void __launch_bounds__(BLOCK_M, 1)
 FlashFwdKernel(T* __restrict__       O_out,
-               float* __restrict__   lse_out,   // (B, H, Tlen) or nullptr
+               float* __restrict__   lse_out,   // (B, H_q, Tlen) or nullptr
                const T* __restrict__ Q,
                const T* __restrict__ K,
                const T* __restrict__ V,
+               const float* __restrict__ mask,  // additive mask or nullptr
                const int64_t         Tlen,
-               const int64_t         H,
+               const int64_t         H_q,
+               const int64_t         H_kv,
                const float           scale,
-               const bool            is_causal) {
+               const bool            is_causal,
+               const int64_t         mask_stride_b,
+               const int64_t         mask_stride_h,
+               const int64_t         mask_stride_m,
+               const int64_t         mask_stride_n) {
     const int tid         = threadIdx.x;                    // 0 .. BLOCK_M-1
-    const int bh          = blockIdx.y;                     // batch * H + head
-    const int64_t b       = bh / H;
-    const int64_t h       = bh % H;
+    const int bh          = blockIdx.y;                     // batch * H_q + head
+    const int64_t b       = bh / H_q;
+    const int64_t h       = bh % H_q;                      // Q head index
+    const int64_t kv_h    = h * H_kv / H_q;                // corresponding KV head
     const int64_t q_start = static_cast<int64_t>(blockIdx.x) * BLOCK_M;
     const int64_t q_pos   = q_start + tid;
     const bool active     = (q_pos < Tlen);
@@ -96,7 +113,7 @@ FlashFwdKernel(T* __restrict__       O_out,
     if (active) {
         #pragma unroll
         for (int d = 0; d < HD; d++)
-            Q_smem[tid * HD + d] = LoadF(&Q[Idx4(b, q_pos, h, d, Tlen, H, HD)]);
+            Q_smem[tid * HD + d] = LoadF(&Q[Idx4(b, q_pos, h, d, Tlen, H_q, HD)]);
     } else {
         #pragma unroll
         for (int d = 0; d < HD; d++)
@@ -120,14 +137,14 @@ FlashFwdKernel(T* __restrict__       O_out,
         // Causal: whole KV tile beyond all Q positions in this block -> stop
         if (is_causal && kv_start > q_start + BLOCK_M - 1) break;
 
-        // --- Cooperative load of K_tile and V_tile ---
+        // --- Cooperative load of K_tile and V_tile (using kv_h for GQA) ---
         for (int r = tid; r < BLOCK_N; r += BLOCK_M) {
             const int64_t kv_pos = kv_start + r;
             if (kv_pos < Tlen) {
                 #pragma unroll
                 for (int d = 0; d < HD; d++) {
-                    K_tile[r * HD + d] = LoadF(&K[Idx4(b, kv_pos, h, d, Tlen, H, HD)]);
-                    V_tile[r * HD + d] = LoadF(&V[Idx4(b, kv_pos, h, d, Tlen, H, HD)]);
+                    K_tile[r * HD + d] = LoadF(&K[Idx4(b, kv_pos, kv_h, d, Tlen, H_kv, HD)]);
+                    V_tile[r * HD + d] = LoadF(&V[Idx4(b, kv_pos, kv_h, d, Tlen, H_kv, HD)]);
                 }
             } else {
                 #pragma unroll
@@ -151,7 +168,10 @@ FlashFwdKernel(T* __restrict__       O_out,
                 #pragma unroll
                 for (int d = 0; d < HD; d++)
                     dot += Q_smem[tid * HD + d] * K_tile[n * HD + d];
-                m_ij = fmaxf(m_ij, dot * scale);
+                float score = dot * scale
+                    + LoadMask(mask, b, h, q_pos, kv_pos,
+                               mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
+                m_ij = fmaxf(m_ij, score);
             }
 
             // --- Online softmax merge ---
@@ -174,7 +194,10 @@ FlashFwdKernel(T* __restrict__       O_out,
                 for (int d = 0; d < HD; d++)
                     dot += Q_smem[tid * HD + d] * K_tile[n * HD + d];
 
-                const float p = expf(dot * scale - m_new);
+                float score = dot * scale
+                    + LoadMask(mask, b, h, q_pos, kv_pos,
+                               mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
+                const float p = expf(score - m_new);
                 l_i += p;
 
                 #pragma unroll
@@ -193,10 +216,10 @@ FlashFwdKernel(T* __restrict__       O_out,
         const float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
         #pragma unroll
         for (int d = 0; d < HD; d++)
-            O_out[Idx4(b, q_pos, h, d, Tlen, H, HD)] = StoreF<T>(o_acc[d] * inv_l);
+            O_out[Idx4(b, q_pos, h, d, Tlen, H_q, HD)] = StoreF<T>(o_acc[d] * inv_l);
 
         if (lse_out) {
-            lse_out[b * H * Tlen + h * Tlen + q_pos] = m_i + logf(l_i + 1e-20f);
+            lse_out[b * H_q * Tlen + h * Tlen + q_pos] = m_i + logf(l_i + 1e-20f);
         }
     }
 }
@@ -207,20 +230,27 @@ FlashFwdKernel(T* __restrict__       O_out,
 
 template <typename T, int HD, int BLOCK_M, int BLOCK_N>
 __global__ void __launch_bounds__(BLOCK_M, 1)
-FlashBwdPreprocessKernel(float* __restrict__   lse_out,  // (B, H, T)
-                         float* __restrict__   D_out,    // (B, H, T)
+FlashBwdPreprocessKernel(float* __restrict__   lse_out,  // (B, H_q, T)
+                         float* __restrict__   D_out,    // (B, H_q, T)
                          const T* __restrict__ Q,
                          const T* __restrict__ K,
                          const T* __restrict__ V,
                          const T* __restrict__ dO,
+                         const float* __restrict__ mask,
                          const int64_t         Tlen,
-                         const int64_t         H,
+                         const int64_t         H_q,
+                         const int64_t         H_kv,
                          const float           scale,
-                         const bool            is_causal) {
+                         const bool            is_causal,
+                         const int64_t         mask_stride_b,
+                         const int64_t         mask_stride_h,
+                         const int64_t         mask_stride_m,
+                         const int64_t         mask_stride_n) {
     const int tid         = threadIdx.x;
     const int bh          = blockIdx.y;
-    const int64_t b       = bh / H;
-    const int64_t h       = bh % H;
+    const int64_t b       = bh / H_q;
+    const int64_t h       = bh % H_q;
+    const int64_t kv_h    = h * H_kv / H_q;
     const int64_t q_start = static_cast<int64_t>(blockIdx.x) * BLOCK_M;
     const int64_t q_pos   = q_start + tid;
     const bool active     = (q_pos < Tlen);
@@ -234,7 +264,7 @@ FlashBwdPreprocessKernel(float* __restrict__   lse_out,  // (B, H, T)
     if (active) {
         #pragma unroll
         for (int d = 0; d < HD; d++)
-            Q_smem[tid * HD + d] = LoadF(&Q[Idx4(b, q_pos, h, d, Tlen, H, HD)]);
+            Q_smem[tid * HD + d] = LoadF(&Q[Idx4(b, q_pos, h, d, Tlen, H_q, HD)]);
     } else {
         #pragma unroll
         for (int d = 0; d < HD; d++)
@@ -246,7 +276,7 @@ FlashBwdPreprocessKernel(float* __restrict__   lse_out,  // (B, H, T)
     if (active) {
         #pragma unroll
         for (int d = 0; d < HD; d++)
-            dO_reg[d] = LoadF(&dO[Idx4(b, q_pos, h, d, Tlen, H, HD)]);
+            dO_reg[d] = LoadF(&dO[Idx4(b, q_pos, h, d, Tlen, H_q, HD)]);
     } else {
         #pragma unroll
         for (int d = 0; d < HD; d++)
@@ -267,17 +297,15 @@ FlashBwdPreprocessKernel(float* __restrict__   lse_out,  // (B, H, T)
     for (int j = 0; j < num_kv_blocks; j++) {
         const int64_t kv_start = static_cast<int64_t>(j) * BLOCK_N;
 
-        // FIXED: correct causal full-tile break condition
         if (is_causal && kv_start > q_start + BLOCK_M - 1) break;
 
-        // FIXED: restore the missing cooperative load loop
         for (int r = tid; r < BLOCK_N; r += BLOCK_M) {
             const int64_t kv_pos = kv_start + r;
             if (kv_pos < Tlen) {
                 #pragma unroll
                 for (int d = 0; d < HD; d++) {
-                    K_tile[r * HD + d] = LoadF(&K[Idx4(b, kv_pos, h, d, Tlen, H, HD)]);
-                    V_tile[r * HD + d] = LoadF(&V[Idx4(b, kv_pos, h, d, Tlen, H, HD)]);
+                    K_tile[r * HD + d] = LoadF(&K[Idx4(b, kv_pos, kv_h, d, Tlen, H_kv, HD)]);
+                    V_tile[r * HD + d] = LoadF(&V[Idx4(b, kv_pos, kv_h, d, Tlen, H_kv, HD)]);
                 }
             } else {
                 #pragma unroll
@@ -300,7 +328,10 @@ FlashBwdPreprocessKernel(float* __restrict__   lse_out,  // (B, H, T)
                 #pragma unroll
                 for (int d = 0; d < HD; d++)
                     dot += Q_smem[tid * HD + d] * K_tile[n * HD + d];
-                m_ij = fmaxf(m_ij, dot * scale);
+                float score = dot * scale
+                    + LoadMask(mask, b, h, q_pos, kv_pos,
+                               mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
+                m_ij = fmaxf(m_ij, score);
             }
 
             const float m_new = fmaxf(m_i, m_ij);
@@ -320,7 +351,10 @@ FlashBwdPreprocessKernel(float* __restrict__   lse_out,  // (B, H, T)
                 for (int d = 0; d < HD; d++)
                     dot += Q_smem[tid * HD + d] * K_tile[n * HD + d];
 
-                const float p = expf(dot * scale - m_new);
+                float score = dot * scale
+                    + LoadMask(mask, b, h, q_pos, kv_pos,
+                               mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
+                const float p = expf(score - m_new);
                 l_i += p;
 
                 #pragma unroll
@@ -342,7 +376,7 @@ FlashBwdPreprocessKernel(float* __restrict__   lse_out,  // (B, H, T)
         for (int d = 0; d < HD; d++)
             D_i += dO_reg[d] * (o_acc[d] * inv_l);
 
-        const int64_t idx = b * H * Tlen + h * Tlen + q_pos;
+        const int64_t idx = b * H_q * Tlen + h * Tlen + q_pos;
         lse_out[idx] = m_i + logf(l_i + 1e-20f);
         D_out[idx]   = D_i;
     }
@@ -361,14 +395,21 @@ FlashBwdDQKernel(T* __restrict__       dQ_out,
                  const T* __restrict__ dO,
                  const float* __restrict__ lse,
                  const float* __restrict__ D_arr,
+                 const float* __restrict__ mask,
                  const int64_t         Tlen,
-                 const int64_t         H,
+                 const int64_t         H_q,
+                 const int64_t         H_kv,
                  const float           scale,
-                 const bool            is_causal) {
+                 const bool            is_causal,
+                 const int64_t         mask_stride_b,
+                 const int64_t         mask_stride_h,
+                 const int64_t         mask_stride_m,
+                 const int64_t         mask_stride_n) {
     const int tid         = threadIdx.x;
     const int bh          = blockIdx.y;
-    const int64_t b       = bh / H;
-    const int64_t h       = bh % H;
+    const int64_t b       = bh / H_q;
+    const int64_t h       = bh % H_q;
+    const int64_t kv_h    = h * H_kv / H_q;
     const int64_t q_start = static_cast<int64_t>(blockIdx.x) * BLOCK_M;
     const int64_t q_pos   = q_start + tid;
     const bool active     = (q_pos < Tlen);
@@ -383,8 +424,8 @@ FlashBwdDQKernel(T* __restrict__       dQ_out,
     if (active) {
         #pragma unroll
         for (int d = 0; d < HD; d++) {
-            Q_smem[tid * HD + d] = LoadF(&Q[Idx4(b, q_pos, h, d, Tlen, H, HD)]);
-            dO_reg[d] = LoadF(&dO[Idx4(b, q_pos, h, d, Tlen, H, HD)]);
+            Q_smem[tid * HD + d] = LoadF(&Q[Idx4(b, q_pos, h, d, Tlen, H_q, HD)]);
+            dO_reg[d] = LoadF(&dO[Idx4(b, q_pos, h, d, Tlen, H_q, HD)]);
         }
     } else {
         #pragma unroll
@@ -397,7 +438,7 @@ FlashBwdDQKernel(T* __restrict__       dQ_out,
 
     float my_lse = 0.0f, my_D = 0.0f;
     if (active) {
-        const int64_t idx = b * H * Tlen + h * Tlen + q_pos;
+        const int64_t idx = b * H_q * Tlen + h * Tlen + q_pos;
         my_lse = lse[idx];
         my_D   = D_arr[idx];
     }
@@ -412,14 +453,14 @@ FlashBwdDQKernel(T* __restrict__       dQ_out,
         const int64_t kv_start = static_cast<int64_t>(j) * BLOCK_N;
         if (is_causal && kv_start > q_start + BLOCK_M - 1) break;
 
-        // Cooperative load of K_tile, V_tile
+        // Cooperative load of K_tile, V_tile (using kv_h)
         for (int r = tid; r < BLOCK_N; r += BLOCK_M) {
             const int64_t kv_pos = kv_start + r;
             if (kv_pos < Tlen) {
                 #pragma unroll
                 for (int d = 0; d < HD; d++) {
-                    K_tile[r * HD + d] = LoadF(&K[Idx4(b, kv_pos, h, d, Tlen, H, HD)]);
-                    V_tile[r * HD + d] = LoadF(&V[Idx4(b, kv_pos, h, d, Tlen, H, HD)]);
+                    K_tile[r * HD + d] = LoadF(&K[Idx4(b, kv_pos, kv_h, d, Tlen, H_kv, HD)]);
+                    V_tile[r * HD + d] = LoadF(&V[Idx4(b, kv_pos, kv_h, d, Tlen, H_kv, HD)]);
                 }
             } else {
                 #pragma unroll
@@ -441,7 +482,10 @@ FlashBwdDQKernel(T* __restrict__       dQ_out,
                 #pragma unroll
                 for (int d = 0; d < HD; d++)
                     dot_qk += Q_smem[tid * HD + d] * K_tile[n * HD + d];
-                const float p_ij = expf(dot_qk * scale - my_lse);
+                float score = dot_qk * scale
+                    + LoadMask(mask, b, h, q_pos, kv_pos,
+                               mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
+                const float p_ij = expf(score - my_lse);
 
                 float dp_ij = 0.0f;
                 #pragma unroll
@@ -463,7 +507,7 @@ FlashBwdDQKernel(T* __restrict__       dQ_out,
     if (active) {
         #pragma unroll
         for (int d = 0; d < HD; d++)
-            dQ_out[Idx4(b, q_pos, h, d, Tlen, H, HD)] = StoreF<T>(dq_acc[d]);
+            dQ_out[Idx4(b, q_pos, h, d, Tlen, H_q, HD)] = StoreF<T>(dq_acc[d]);
     }
 }
 
@@ -481,14 +525,20 @@ FlashBwdDKVKernel(T* __restrict__       dK_out,
                   const T* __restrict__ dO,
                   const float* __restrict__ lse,
                   const float* __restrict__ D_arr,
+                  const float* __restrict__ mask,
                   const int64_t         Tlen,
-                  const int64_t         H,
+                  const int64_t         H_q,
+                  const int64_t         H_kv,
                   const float           scale,
-                  const bool            is_causal) {
+                  const bool            is_causal,
+                  const int64_t         mask_stride_b,
+                  const int64_t         mask_stride_h,
+                  const int64_t         mask_stride_m,
+                  const int64_t         mask_stride_n) {
     const int tid          = threadIdx.x;               // 0 .. BLOCK_N-1
-    const int bh           = blockIdx.y;
-    const int64_t b        = bh / H;
-    const int64_t h        = bh % H;
+    const int bh           = blockIdx.y;                // b * H_kv + kv_h
+    const int64_t b        = bh / H_kv;
+    const int64_t kv_h     = bh % H_kv;
     const int64_t kv_start = static_cast<int64_t>(blockIdx.x) * BLOCK_N;
     const int64_t s_pos    = kv_start + tid;
 
@@ -499,7 +549,7 @@ FlashBwdDKVKernel(T* __restrict__       dK_out,
     float* D_tile   = smem + 2 * BLOCK_M * HD + BLOCK_M;           // BLOCK_M
 
     const int64_t kv_base = (s_pos < Tlen)
-                          ? Idx4(b, s_pos, h, 0, Tlen, H, HD)
+                          ? Idx4(b, s_pos, kv_h, 0, Tlen, H_kv, HD)
                           : 0;
 
     float dk_acc[HD], dv_acc[HD];
@@ -507,76 +557,84 @@ FlashBwdDKVKernel(T* __restrict__       dK_out,
     for (int d = 0; d < HD; d++) { dk_acc[d] = 0.0f; dv_acc[d] = 0.0f; }
 
     const int num_q_blocks = (static_cast<int>(Tlen) + BLOCK_M - 1) / BLOCK_M;
+    const int64_t group_size = H_q / H_kv;
 
-    for (int i = 0; i < num_q_blocks; i++) {
-        const int64_t q_start_tile = static_cast<int64_t>(i) * BLOCK_M;
+    // Iterate over all Q heads that share this KV head
+    for (int64_t g = 0; g < group_size; g++) {
+        const int64_t q_h = kv_h * group_size + g;
 
-        // Causal: if all q in tile < s_pos then those q can't attend to s_pos? actually for causal,
-        // condition is "s_pos > q_pos => masked". If s_pos is greater than max q_pos in tile, skip.
-        if (is_causal && q_start_tile + BLOCK_M - 1 < s_pos) continue;
+        for (int i = 0; i < num_q_blocks; i++) {
+            const int64_t q_start_tile = static_cast<int64_t>(i) * BLOCK_M;
 
-        // Cooperative load of Q_tile, dO_tile, stats
-        for (int r = tid; r < BLOCK_M; r += BLOCK_N) {
-            const int64_t q_pos = q_start_tile + r;
-            if (q_pos < Tlen) {
-                #pragma unroll
-                for (int d = 0; d < HD; d++) {
-                    Q_tile[r * HD + d]  = LoadF(&Q[Idx4(b, q_pos, h, d, Tlen, H, HD)]);
-                    dO_tile[r * HD + d] = LoadF(&dO[Idx4(b, q_pos, h, d, Tlen, H, HD)]);
+            // Causal: if all q in tile < s_pos, skip
+            if (is_causal && q_start_tile + BLOCK_M - 1 < s_pos) continue;
+
+            // Cooperative load of Q_tile, dO_tile, stats for head q_h
+            for (int r = tid; r < BLOCK_M; r += BLOCK_N) {
+                const int64_t q_pos = q_start_tile + r;
+                if (q_pos < Tlen) {
+                    #pragma unroll
+                    for (int d = 0; d < HD; d++) {
+                        Q_tile[r * HD + d]  = LoadF(&Q[Idx4(b, q_pos, q_h, d, Tlen, H_q, HD)]);
+                        dO_tile[r * HD + d] = LoadF(&dO[Idx4(b, q_pos, q_h, d, Tlen, H_q, HD)]);
+                    }
+                    const int64_t stat_idx = b * H_q * Tlen + q_h * Tlen + q_pos;
+                    lse_tile[r] = lse[stat_idx];
+                    D_tile[r]   = D_arr[stat_idx];
+                } else {
+                    #pragma unroll
+                    for (int d = 0; d < HD; d++) {
+                        Q_tile[r * HD + d]  = 0.0f;
+                        dO_tile[r * HD + d] = 0.0f;
+                    }
+                    lse_tile[r] = 0.0f;
+                    D_tile[r]   = 0.0f;
                 }
-                const int64_t stat_idx = b * H * Tlen + h * Tlen + q_pos;
-                lse_tile[r] = lse[stat_idx];
-                D_tile[r]   = D_arr[stat_idx];
-            } else {
-                #pragma unroll
-                for (int d = 0; d < HD; d++) {
-                    Q_tile[r * HD + d]  = 0.0f;
-                    dO_tile[r * HD + d] = 0.0f;
+            }
+            __syncthreads();
+
+            if (s_pos < Tlen) {
+                for (int m = 0; m < BLOCK_M; m++) {
+                    const int64_t q_pos = q_start_tile + m;
+                    if (q_pos >= Tlen) continue;
+                    if (is_causal && s_pos > q_pos) continue;
+
+                    float dot_qk = 0.0f;
+                    #pragma unroll
+                    for (int d = 0; d < HD; d++)
+                        dot_qk += Q_tile[m * HD + d] * LoadF(&K[kv_base + d]);
+                    float score = dot_qk * scale
+                        + LoadMask(mask, b, q_h, q_pos, s_pos,
+                                   mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
+                    const float p_val = expf(score - lse_tile[m]);
+
+                    #pragma unroll
+                    for (int d = 0; d < HD; d++)
+                        dv_acc[d] += p_val * dO_tile[m * HD + d];
+
+                    float dp_val = 0.0f;
+                    #pragma unroll
+                    for (int d = 0; d < HD; d++)
+                        dp_val += dO_tile[m * HD + d] * LoadF(&V[kv_base + d]);
+
+                    const float ds_val = p_val * (dp_val - D_tile[m]);
+                    const float s_ds = scale * ds_val;
+
+                    #pragma unroll
+                    for (int d = 0; d < HD; d++)
+                        dk_acc[d] += s_ds * Q_tile[m * HD + d];
                 }
-                lse_tile[r] = 0.0f;
-                D_tile[r]   = 0.0f;
             }
+
+            __syncthreads();
         }
-        __syncthreads();
-
-        if (s_pos < Tlen) {
-            for (int m = 0; m < BLOCK_M; m++) {
-                const int64_t q_pos = q_start_tile + m;
-                if (q_pos >= Tlen) continue;
-                if (is_causal && s_pos > q_pos) continue;
-
-                float dot_qk = 0.0f;
-                #pragma unroll
-                for (int d = 0; d < HD; d++)
-                    dot_qk += Q_tile[m * HD + d] * LoadF(&K[kv_base + d]);
-                const float p_val = expf(dot_qk * scale - lse_tile[m]);
-
-                #pragma unroll
-                for (int d = 0; d < HD; d++)
-                    dv_acc[d] += p_val * dO_tile[m * HD + d];
-
-                float dp_val = 0.0f;
-                #pragma unroll
-                for (int d = 0; d < HD; d++)
-                    dp_val += dO_tile[m * HD + d] * LoadF(&V[kv_base + d]);
-
-                const float ds_val = p_val * (dp_val - D_tile[m]);
-                const float s_ds = scale * ds_val;
-
-                #pragma unroll
-                for (int d = 0; d < HD; d++)
-                    dk_acc[d] += s_ds * Q_tile[m * HD + d];
-            }
-        }
-
-        __syncthreads();
     }
 
     if (s_pos < Tlen) {
         #pragma unroll
         for (int d = 0; d < HD; d++) {
-            dK_out[Idx4(b, s_pos, h, d, Tlen, H, HD)] = StoreF<T>(dk_acc[d]);
-            dV_out[Idx4(b, s_pos, h, d, Tlen, H, HD)] = StoreF<T>(dv_acc[d]);
+            dK_out[Idx4(b, s_pos, kv_h, d, Tlen, H_kv, HD)] = StoreF<T>(dk_acc[d]);
+            dV_out[Idx4(b, s_pos, kv_h, d, Tlen, H_kv, HD)] = StoreF<T>(dv_acc[d]);
         }
     }
 }
@@ -595,19 +653,43 @@ static cudaStream_t GetCudaStream(const std::shared_ptr<Tensor>& tensor) {
 static constexpr int BM = 64;
 static constexpr int BN = 32;
 
+// Compute mask strides with broadcasting support.
+// mask_dims should have 4 elements: (B_m, H_m, L, S).
+// If a dimension is 1, its stride is set to 0 (broadcast).
+static void ComputeMaskStrides(const std::vector<int64_t>& mask_dims,
+                               int64_t& stride_b, int64_t& stride_h,
+                               int64_t& stride_m, int64_t& stride_n) {
+    // mask_dims: (B_m, H_m, L, S) — contiguous row-major
+    const int64_t B_m = mask_dims[0];
+    const int64_t H_m = mask_dims[1];
+    const int64_t L   = mask_dims[2];
+    const int64_t S   = mask_dims[3];
+
+    // Contiguous strides
+    stride_n = 1;
+    stride_m = S;
+    stride_h = (H_m > 1) ? L * S : 0;
+    stride_b = (B_m > 1) ? H_m * L * S : 0;
+}
+
 
 template <typename T, int HD>
 void LaunchFlashForward(const std::shared_ptr<Tensor>& y,
                         const std::shared_ptr<Tensor>& q,
                         const std::shared_ptr<Tensor>& k,
                         const std::shared_ptr<Tensor>& v,
+                        const float* mask_ptr,
+                        int64_t mask_stride_b, int64_t mask_stride_h,
+                        int64_t mask_stride_m, int64_t mask_stride_n,
                         float scale, bool is_causal) {
-    const auto& dims = q->Dims();
-    const int64_t B = dims[0], Tlen = dims[1], H = dims[2];
-    if (B * Tlen * H == 0) return;
+    const auto& q_dims = q->Dims();
+    const auto& k_dims = k->Dims();
+    const int64_t B = q_dims[0], Tlen = q_dims[1], H_q = q_dims[2];
+    const int64_t H_kv = k_dims[2];
+    if (B * Tlen * H_q == 0) return;
 
     dim3 grid(static_cast<unsigned>((Tlen + BM - 1) / BM),
-              static_cast<unsigned>(B * H));
+              static_cast<unsigned>(B * H_q));
     dim3 block(BM);
 
     const size_t smem_bytes = static_cast<size_t>(BM + 2 * BN) * HD * sizeof(float);
@@ -619,7 +701,9 @@ void LaunchFlashForward(const std::shared_ptr<Tensor>& y,
         static_cast<const T*>(q->DataPtr()),
         static_cast<const T*>(k->DataPtr()),
         static_cast<const T*>(v->DataPtr()),
-        Tlen, H, scale, is_causal);
+        mask_ptr,
+        Tlen, H_q, H_kv, scale, is_causal,
+        mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
 }
 
 template <typename T, int HD>
@@ -630,15 +714,20 @@ void LaunchFlashBackward(const std::shared_ptr<Tensor>& dq,
                          const std::shared_ptr<Tensor>& q,
                          const std::shared_ptr<Tensor>& k,
                          const std::shared_ptr<Tensor>& v,
+                         const float* mask_ptr,
+                         int64_t mask_stride_b, int64_t mask_stride_h,
+                         int64_t mask_stride_m, int64_t mask_stride_n,
                          float scale, bool is_causal) {
-    const auto& dims = q->Dims();
-    const int64_t B = dims[0], Tlen = dims[1], H = dims[2];
-    if (B * Tlen * H == 0) return;
+    const auto& q_dims = q->Dims();
+    const auto& k_dims = k->Dims();
+    const int64_t B = q_dims[0], Tlen = q_dims[1], H_q = q_dims[2];
+    const int64_t H_kv = k_dims[2];
+    if (B * Tlen * H_q == 0) return;
 
     auto stream = GetCudaStream(dq);
 
-    // Scratch for LSE and D_i
-    const int64_t stat_size = B * H * Tlen;
+    // Scratch for LSE and D_i (indexed by Q heads)
+    const int64_t stat_size = B * H_q * Tlen;
     float* lse_buf = nullptr;
     float* D_buf   = nullptr;
 
@@ -653,10 +742,10 @@ void LaunchFlashBackward(const std::shared_ptr<Tensor>& dq,
         << "Failed to allocate D buffer (" << (stat_size * 4) << " bytes): "
         << cudaGetErrorString(err2);
 
-    // Step 1: preprocess
+    // Step 1: preprocess (grid over Q heads)
     {
         dim3 grid_pre(static_cast<unsigned>((Tlen + BM - 1) / BM),
-                      static_cast<unsigned>(B * H));
+                      static_cast<unsigned>(B * H_q));
         dim3 block_pre(BM);
         const size_t smem_pre = static_cast<size_t>(BM + 2 * BN) * HD * sizeof(float);
 
@@ -666,13 +755,15 @@ void LaunchFlashBackward(const std::shared_ptr<Tensor>& dq,
             static_cast<const T*>(k->DataPtr()),
             static_cast<const T*>(v->DataPtr()),
             static_cast<const T*>(dy->DataPtr()),
-            Tlen, H, scale, is_causal);
+            mask_ptr,
+            Tlen, H_q, H_kv, scale, is_causal,
+            mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
     }
 
-    // Step 2: dQ
+    // Step 2: dQ (grid over Q heads)
     {
         dim3 grid_dq(static_cast<unsigned>((Tlen + BM - 1) / BM),
-                     static_cast<unsigned>(B * H));
+                     static_cast<unsigned>(B * H_q));
         dim3 block_dq(BM);
         const size_t smem_dq = static_cast<size_t>(BM + 2 * BN) * HD * sizeof(float);
 
@@ -683,13 +774,15 @@ void LaunchFlashBackward(const std::shared_ptr<Tensor>& dq,
             static_cast<const T*>(v->DataPtr()),
             static_cast<const T*>(dy->DataPtr()),
             lse_buf, D_buf,
-            Tlen, H, scale, is_causal);
+            mask_ptr,
+            Tlen, H_q, H_kv, scale, is_causal,
+            mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
     }
 
-    // Step 3: dK, dV
+    // Step 3: dK, dV (grid over KV heads)
     {
         dim3 grid_dkv(static_cast<unsigned>((Tlen + BN - 1) / BN),
-                      static_cast<unsigned>(B * H));
+                      static_cast<unsigned>(B * H_kv));
         dim3 block_dkv(BN);
         const size_t smem_dkv = static_cast<size_t>(2 * BM * HD + 2 * BM) * sizeof(float);
 
@@ -701,7 +794,9 @@ void LaunchFlashBackward(const std::shared_ptr<Tensor>& dq,
             static_cast<const T*>(v->DataPtr()),
             static_cast<const T*>(dy->DataPtr()),
             lse_buf, D_buf,
-            Tlen, H, scale, is_causal);
+            mask_ptr,
+            Tlen, H_q, H_kv, scale, is_causal,
+            mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n);
     }
 
     // Free scratch
@@ -725,12 +820,15 @@ void DispatchForwardByHD(int HD,
                          const std::shared_ptr<Tensor>& q,
                          const std::shared_ptr<Tensor>& k,
                          const std::shared_ptr<Tensor>& v,
+                         const float* mask_ptr,
+                         int64_t mask_stride_b, int64_t mask_stride_h,
+                         int64_t mask_stride_m, int64_t mask_stride_n,
                          float scale, bool is_causal) {
     switch (HD) {
-        case 32:  LaunchFlashForward<T, 32> (y, q, k, v, scale, is_causal); break;
-        case 64:  LaunchFlashForward<T, 64> (y, q, k, v, scale, is_causal); break;
-        case 96:  LaunchFlashForward<T, 96> (y, q, k, v, scale, is_causal); break;
-        case 128: LaunchFlashForward<T, 128>(y, q, k, v, scale, is_causal); break;
+        case 32:  LaunchFlashForward<T, 32> (y, q, k, v, mask_ptr, mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n, scale, is_causal); break;
+        case 64:  LaunchFlashForward<T, 64> (y, q, k, v, mask_ptr, mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n, scale, is_causal); break;
+        case 96:  LaunchFlashForward<T, 96> (y, q, k, v, mask_ptr, mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n, scale, is_causal); break;
+        case 128: LaunchFlashForward<T, 128>(y, q, k, v, mask_ptr, mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n, scale, is_causal); break;
         default:
             LOG_LOC(FATAL, "FlashAttention forward: unsupported head dim "
                     << HD << ". Supported: 32, 64, 96, 128.");
@@ -746,20 +844,67 @@ void DispatchBackwardByHD(int HD,
                           const std::shared_ptr<Tensor>& q,
                           const std::shared_ptr<Tensor>& k,
                           const std::shared_ptr<Tensor>& v,
+                          const float* mask_ptr,
+                          int64_t mask_stride_b, int64_t mask_stride_h,
+                          int64_t mask_stride_m, int64_t mask_stride_n,
                           float scale, bool is_causal) {
     switch (HD) {
         case 32:
-            LaunchFlashBackward<T, 32> (dq, dk, dv, dy, q, k, v, scale, is_causal); break;
+            LaunchFlashBackward<T, 32> (dq, dk, dv, dy, q, k, v, mask_ptr, mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n, scale, is_causal); break;
         case 64:
-            LaunchFlashBackward<T, 64> (dq, dk, dv, dy, q, k, v, scale, is_causal); break;
+            LaunchFlashBackward<T, 64> (dq, dk, dv, dy, q, k, v, mask_ptr, mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n, scale, is_causal); break;
         case 96:
-            LaunchFlashBackward<T, 96> (dq, dk, dv, dy, q, k, v, scale, is_causal); break;
+            LaunchFlashBackward<T, 96> (dq, dk, dv, dy, q, k, v, mask_ptr, mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n, scale, is_causal); break;
         case 128:
-            LaunchFlashBackward<T, 128>(dq, dk, dv, dy, q, k, v, scale, is_causal); break;
+            LaunchFlashBackward<T, 128>(dq, dk, dv, dy, q, k, v, mask_ptr, mask_stride_b, mask_stride_h, mask_stride_m, mask_stride_n, scale, is_causal); break;
         default:
             LOG_LOC(FATAL, "FlashAttention backward: unsupported head dim "
                     << HD << ". Supported: 32, 64, 96, 128.");
     }
+}
+
+// ============================================================================
+// Mask preparation helper
+// ============================================================================
+
+// Prepare mask: convert to float32 if needed, normalize shape to 4D,
+// compute broadcast strides.  Returns (float pointer on device, strides).
+// If attn_mask is nullptr, returns (nullptr, 0,0,0,0) and leaves mask_f32 untouched.
+static void PrepareMask(const std::shared_ptr<Tensor>& attn_mask,
+                        std::shared_ptr<Tensor>& mask_f32,
+                        const float*& mask_ptr,
+                        int64_t& stride_b, int64_t& stride_h,
+                        int64_t& stride_m, int64_t& stride_n) {
+    mask_ptr = nullptr;
+    stride_b = stride_h = stride_m = stride_n = 0;
+
+    if (!attn_mask) return;
+
+    // Convert to float32 if necessary
+    if (attn_mask->Dtype() != DataType::kFLOAT32) {
+        mask_f32 = std::make_shared<Tensor>(attn_mask->To(DataType::kFLOAT32));
+    } else {
+        mask_f32 = attn_mask;
+    }
+
+    const auto& dims = mask_f32->Dims();
+    std::vector<int64_t> dims4;
+
+    if (dims.size() == 2) {
+        // (L, S) -> (1, 1, L, S)
+        dims4 = {1, 1, dims[0], dims[1]};
+    } else if (dims.size() == 3) {
+        // (X, L, S) -> (X, 1, L, S)  — X could be B
+        dims4 = {dims[0], 1, dims[1], dims[2]};
+    } else if (dims.size() == 4) {
+        dims4 = {dims[0], dims[1], dims[2], dims[3]};
+    } else {
+        LOG_LOC(FATAL, "FlashAttention: attn_mask must be 2D, 3D, or 4D, got "
+                << dims.size() << "D.");
+    }
+
+    ComputeMaskStrides(dims4, stride_b, stride_h, stride_m, stride_n);
+    mask_ptr = static_cast<const float*>(mask_f32->DataPtr());
 }
 
 // ============================================================================
@@ -770,17 +915,33 @@ std::shared_ptr<Tensor> ScaledDotProductAttentionForward(
     const std::shared_ptr<Tensor>& q,
     const std::shared_ptr<Tensor>& k,
     const std::shared_ptr<Tensor>& v,
-    const std::shared_ptr<Tensor>& /*attn_mask*/,
+    const std::shared_ptr<Tensor>& attn_mask,
     double /*dropout_p*/,
     bool is_causal,
     double scale,
-    bool /*enable_gqa*/) {
+    bool enable_gqa) {
     CHECK(q);
     CHECK(k);
     CHECK(v);
     CHECK_EQ(q->Dims().size(), 4);
     CHECK_EQ(k->Dims().size(), 4);
     CHECK_EQ(v->Dims().size(), 4);
+
+    const int64_t H_q  = q->Dims()[2];
+    const int64_t H_kv = k->Dims()[2];
+    if (!enable_gqa) {
+        CHECK_EQ(H_q, H_kv)
+            << "Q heads (" << H_q << ") != KV heads (" << H_kv
+            << "). Set enable_gqa=true for grouped-query attention.";
+    }
+    CHECK(H_q % H_kv == 0)
+        << "Q heads (" << H_q << ") must be divisible by KV heads (" << H_kv << ").";
+
+    // Prepare mask
+    std::shared_ptr<Tensor> mask_f32;
+    const float* mask_ptr = nullptr;
+    int64_t ms_b = 0, ms_h = 0, ms_m = 0, ms_n = 0;
+    PrepareMask(attn_mask, mask_f32, mask_ptr, ms_b, ms_h, ms_m, ms_n);
 
     auto dtype = q->Dtype();
     auto y = std::make_shared<Tensor>(q->Dims(), dtype, q->GetDevice());
@@ -789,10 +950,12 @@ std::shared_ptr<Tensor> ScaledDotProductAttentionForward(
     switch (dtype) {
         DISPATCH_CASE(
             WRAP(DispatchForwardByHD<float>(HD, y, q, k, v,
+                                            mask_ptr, ms_b, ms_h, ms_m, ms_n,
                                             static_cast<float>(scale), is_causal);),
             DataType::kFLOAT32)
         DISPATCH_CASE(
             WRAP(DispatchForwardByHD<nv_bfloat16>(HD, y, q, k, v,
+                                                  mask_ptr, ms_b, ms_h, ms_m, ms_n,
                                                   static_cast<float>(scale), is_causal);),
             DataType::kBFLOAT16)
     default:
@@ -806,15 +969,25 @@ std::vector<std::shared_ptr<Tensor>> ScaledDotProductAttentionBackward(
     const std::shared_ptr<Tensor>& q,
     const std::shared_ptr<Tensor>& k,
     const std::shared_ptr<Tensor>& v,
-    const std::shared_ptr<Tensor>& /*attn_mask*/,
+    const std::shared_ptr<Tensor>& attn_mask,
     double /*dropout_p*/,
     bool is_causal,
     double scale,
-    bool /*enable_gqa*/) {
+    bool enable_gqa) {
     CHECK(dy);
     CHECK(q);
     CHECK(k);
     CHECK(v);
+
+    const int64_t H_q  = q->Dims()[2];
+    const int64_t H_kv = k->Dims()[2];
+    if (!enable_gqa) {
+        CHECK_EQ(H_q, H_kv)
+            << "Q heads (" << H_q << ") != KV heads (" << H_kv
+            << "). Set enable_gqa=true for grouped-query attention.";
+    }
+    CHECK(H_q % H_kv == 0)
+        << "Q heads (" << H_q << ") must be divisible by KV heads (" << H_kv << ").";
 
     // Type promotion (same logic as original)
     auto dy_dtype = dy->Dtype();
@@ -835,19 +1008,28 @@ std::vector<std::shared_ptr<Tensor>> ScaledDotProductAttentionBackward(
     auto k_p  = k_dtype  == promoted_type ? k  : std::make_shared<Tensor>(k->To(promoted_type));
     auto v_p  = v_dtype  == promoted_type ? v  : std::make_shared<Tensor>(v->To(promoted_type));
 
+    // dQ has shape of Q (B, T, H_q, D), dK/dV have shape of K/V (B, T, H_kv, D)
     auto dq = std::make_shared<Tensor>(q->Dims(), promoted_type, q->GetDevice());
     auto dk = std::make_shared<Tensor>(k->Dims(), promoted_type, k->GetDevice());
     auto dv = std::make_shared<Tensor>(v->Dims(), promoted_type, q->GetDevice());
+
+    // Prepare mask
+    std::shared_ptr<Tensor> mask_f32;
+    const float* mask_ptr = nullptr;
+    int64_t ms_b = 0, ms_h = 0, ms_m = 0, ms_n = 0;
+    PrepareMask(attn_mask, mask_f32, mask_ptr, ms_b, ms_h, ms_m, ms_n);
 
     const int HD = static_cast<int>(q->Dims()[3]);
 
     switch (promoted_type) {
         DISPATCH_CASE(
             WRAP(DispatchBackwardByHD<float>(HD, dq, dk, dv, dy_p, q_p, k_p, v_p,
+                                             mask_ptr, ms_b, ms_h, ms_m, ms_n,
                                              static_cast<float>(scale), is_causal);),
             DataType::kFLOAT32)
         DISPATCH_CASE(
             WRAP(DispatchBackwardByHD<nv_bfloat16>(HD, dq, dk, dv, dy_p, q_p, k_p, v_p,
+                                                   mask_ptr, ms_b, ms_h, ms_m, ms_n,
                                                    static_cast<float>(scale), is_causal);),
             DataType::kBFLOAT16)
     default:
@@ -870,3 +1052,4 @@ REGISTER_CUDA_SDPA_KERNEL(ScaledDotProductAttentionForward)
 REGISTER_CUDA_SDPA_KERNEL(ScaledDotProductAttentionBackward)
 
 #undef REGISTER_CUDA_SDPA_KERNEL
+

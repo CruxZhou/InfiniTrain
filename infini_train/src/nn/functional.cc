@@ -92,13 +92,13 @@ std::shared_ptr<Tensor> ScaledDotProductAttention(
     std::optional<double> scale,
     bool enable_gqa) {
     
-    // auto q = query->Contiguous();
-    // auto k = key->Contiguous();
-    // auto v = value->Contiguous();
+    auto q = query->Contiguous();
+    auto k = key->Contiguous();
+    auto v = value->Contiguous();
     
-    auto q = query;
-    auto k = key;
-    auto v = value;
+    // auto q = query;
+    // auto k = key;
+    // auto v = value;
 
     std::vector<std::shared_ptr<Tensor>> inputs;
     inputs.reserve(attn_mask ? 4 : 3);
