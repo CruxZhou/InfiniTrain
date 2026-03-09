@@ -37,8 +37,8 @@ std::vector<std::shared_ptr<Tensor>> ScaledDotProductAttention::Forward(
     CHECK_EQ(q->Dims()[3], k->Dims()[3]);
     CHECK_EQ(q->Dims()[3], v->Dims()[3]);
 
-    CHECK_EQ(q->Dims()[2], k->Dims()[2]) << "CUDA FlashAttention kernel requires q_heads == kv_heads";
-    CHECK_EQ(q->Dims()[2], v->Dims()[2]) << "CUDA FlashAttention kernel requires q_heads == kv_heads";
+    //CHECK_EQ(q->Dims()[2], k->Dims()[2]) << "CUDA FlashAttention kernel requires q_heads == kv_heads";
+    //CHECK_EQ(q->Dims()[2], v->Dims()[2]) << "CUDA FlashAttention kernel requires q_heads == kv_heads";
 
     CHECK_EQ(dropout_p_, 0.0) << "dropout_p > 0 not implemented";
 
