@@ -209,8 +209,7 @@ std::vector<std::shared_ptr<Tensor>> CausalSelfAttention::Forward(const std::vec
 
     // align n_head in GQA
     // (B, T, KV_local, D) -> (B, T, H_local, D) via RepeatKV
-    k = RepeatKV(k, n_rep_);
-    v = RepeatKV(v, n_rep_);
+    
 
     std::shared_ptr<Tensor> y;
     if (config_.flash) { 
@@ -219,19 +218,20 @@ std::vector<std::shared_ptr<Tensor>> CausalSelfAttention::Forward(const std::vec
             attn_mask = std::make_shared<Tensor>(mask->To(DataType::kFLOAT32));
             attn_mask = attn_mask * static_cast<double>(std::numeric_limits<float>::lowest());
         }
-
         y = nn::function::ScaledDotProductAttention(
-            q,
-            k,
-            v,
-            /*attn_mask=*/attn_mask,
-            /*dropout_p=*/0.0,
-            /*is_causal=*/attn_mask ? false : true);
+        q, k, v,
+        /*attn_mask=*/attn_mask,
+        /*dropout_p=*/0.0,
+        /*is_causal=*/attn_mask ? false : true,
+        /*scale=*/std::nullopt,
+        /*enable_gqa=*/true);
+        
 
         // y: (B, T, H_local, D)
     }else{
         
-        
+        k = RepeatKV(k, n_rep_);
+        v = RepeatKV(v, n_rep_);
         
         // (B, T, H_local, D) -> (B, H_local, T, D)
         q = q->Transpose(1, 2);
