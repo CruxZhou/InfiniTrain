@@ -202,7 +202,9 @@ std::vector<std::shared_ptr<Tensor>> CausalSelfAttention::Forward(const std::vec
     // -> RoPE on q, k
     // q: (B, T, H_local, D)
     // k: (B, T, KV_local, D)
+
     std::tie(q, k) = ApplyRotaryEmbedding(q, k, freqs_cis);
+
 
     // TODO(zbl): use kv cache during inference
     // if (use_kv_) { ... }
@@ -220,7 +222,7 @@ std::vector<std::shared_ptr<Tensor>> CausalSelfAttention::Forward(const std::vec
         }
         y = nn::function::ScaledDotProductAttention(
         q, k, v,
-        /*attn_mask=*/attn_mask,
+        /*attn_mask=*/nullptr,
         /*dropout_p=*/0.0,
         /*is_causal=*/attn_mask ? false : true,
         /*scale=*/std::nullopt,

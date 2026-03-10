@@ -96,10 +96,6 @@ std::shared_ptr<Tensor> ScaledDotProductAttention(
     auto k = key->Contiguous();
     auto v = value->Contiguous();
     
-    // auto q = query;
-    // auto k = key;
-    // auto v = value;
-
     std::vector<std::shared_ptr<Tensor>> inputs;
     inputs.reserve(attn_mask ? 4 : 3);
     inputs.push_back(q);
